@@ -1,5 +1,5 @@
 # phonecam
-
+**Warning! Vibecoded as fuck, use at your own risk, or don't, I don't care**
 Two cameras, one OBS scene, zero virtual-camera drivers.
 
 Unofficial project, not affiliated with Lovense or VDO.Ninja. "Lovense" is a trademark of its owner.
