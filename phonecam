@@ -1,0 +1,1757 @@
+#!/usr/bin/env python3
+"""phonecam — phone camera and Lovense overlay for OBS.
+
+Phone side: generates a VDO.Ninja room, puts it into an OBS browser source and
+shows a QR code that the phone scans to start publishing.
+
+Lovense side: runs a local relay that speaks the Lovense OBS Toolset protocol,
+serves the Lovense Cam widget to OBS and answers the Lovense Chrome extension.
+No Splitcam, no Windows toolset, no virtual camera drivers.
+
+Usage:
+  phonecam start                  start the relay, create OBS sources, show QR
+  phonecam doctor                 check the environment
+  phonecam phone <command>        phone camera commands
+  phonecam lovense <command>      Lovense widget commands
+
+Shorthand aliases (kept for compatibility):
+  new, url, qr, obs, all, refresh, layout, status, enable-ws
+
+Ports (must match the Lovense extension and widget):
+  20996  the Chrome extension always dials ws://localhost:20996
+  11000  internal relay (the widget reads ?port=, default 11000)
+  8888   HTTP server that serves the widget and /health
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import base64
+import contextlib
+import functools
+import hashlib
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+import uuid
+import zipfile
+from pathlib import Path
+
+APP = "phonecam"
+VERSION = "1.0.0"
+
+HOME = Path.home()
+SCRIPT_DIR = Path(__file__).resolve().parent
+CONFIG_DIR = Path(os.environ.get("PHONECAM_CONFIG_DIR", HOME / ".config" / "phonecam"))
+CONFIG_FILE = CONFIG_DIR / "config.json"
+DATA_DIR = Path(os.environ.get("PHONECAM_DATA_DIR", HOME / ".local" / "share" / "phonecam"))
+CACHE_DIR = DATA_DIR / "cache"
+OBS_WS_CONFIG = HOME / ".config" / "obs-studio" / "plugin_config" / "obs-websocket" / "config.json"
+CHROME_FLAGS = HOME / ".config" / "chrome-flags.conf"
+SYSTEMD_DIR = HOME / ".config" / "systemd" / "user"
+UNIT_NAME = "phonecam-lovense.service"
+UNIT_PATH = SYSTEMD_DIR / UNIT_NAME
+LEGACY_UNIT = "lovense-obs-relay.service"
+
+RELAY_HOST = "127.0.0.1"
+RELAY_PORT = int(os.environ.get("PHONECAM_RELAY_PORT", "11000"))
+HTTP_PORT = int(os.environ.get("PHONECAM_HTTP_PORT", "8888"))
+PROXY_PORT = int(os.environ.get("PHONECAM_PROXY_PORT", "20996"))
+
+UID = "local-obs-1"
+AES_KEY = b"3d4ab4b0bb42dd54"
+AES_IV = b"262ef81aafa7a095"
+
+DEFAULT_SCENE = "PhoneCam"
+PHONE_SOURCE = "PhoneCam"
+LOVENSE_SOURCE = "Lovense Cam"
+LOVENSE_CSS = "body { background-color: rgba(0,0,0,0); margin: 0; overflow: hidden; }"
+
+TOOLSET_URL = "https://www.lovense.com/files/apps/cam/obs/Lovense_OBS_Toolset_x64.exe"
+EXTENSION_URL = "https://www.lovense.com/files/apps/cam/lovense_cam.zip"
+USER_AGENT = f"{APP}/{VERSION}"
+
+PUSH_URL = ("https://vdo.ninja/?push={room}&webcam&autostart&mobile"
+            "&bitrate={bitrate}{facing}{extra}")
+VIEW_URL = "https://vdo.ninja/?view={room}&cleanoutput&autoplay&showintro=0{extra}"
+
+DEFAULT_RESPONSES = {
+    "GetOBSApplicationShowStatus": {"show": True},
+    "GetSceneList": {"scenes": [{"name": DEFAULT_SCENE}]},
+    "GetStreamingStatus": {"streaming": False, "recording": False, "isVirtualCam": False},
+    "GetStreamSettings": {"settings": {}},
+    "GetVirtualCamStatus": {"isVirtualCam": False},
+    "GetRecordingStatus": {"recording": False, "isRecording": False},
+    "GetCurrentScene": {"scene": {"name": DEFAULT_SCENE}},
+    "GetStudioModeStatus": {"studioMode": False},
+}
+
+# Messages emitted by the relay to the panel: everything is AES-encrypted
+# because the extension decrypts every incoming frame before parsing it.
+try:
+    from cryptography.hazmat.primitives import padding as _padding
+    from cryptography.hazmat.primitives.ciphers import Cipher as _Cipher
+    from cryptography.hazmat.primitives.ciphers import algorithms as _algorithms
+    from cryptography.hazmat.primitives.ciphers import modes as _modes
+    HAVE_CRYPTO = True
+except Exception:  # pragma: no cover - dependency check
+    HAVE_CRYPTO = False
+
+try:
+    import websockets
+except Exception:  # pragma: no cover
+    websockets = None
+
+try:
+    from aiohttp import web as _web
+    HAVE_AIOHTTP = True
+except Exception:  # pragma: no cover
+    _web = None
+    HAVE_AIOHTTP = False
+
+
+# --------------------------------------------------------------------------
+# small helpers
+# --------------------------------------------------------------------------
+
+def say(message=""):
+    print(message, flush=True)
+
+
+def ok(message):
+    say(f"  [ok]   {message}")
+
+
+def warn(message):
+    say(f"  [warn] {message}")
+
+
+def fail(message):
+    say(f"  [fail] {message}")
+
+
+def die(message):
+    raise SystemExit(f"{APP}: {message}")
+
+
+def have(binary):
+    return shutil.which(binary) is not None
+
+
+def human_size(num):
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if num < 1024 or unit == "GiB":
+            return f"{num:.1f} {unit}"
+        num /= 1024
+    return f"{num:.1f} GiB"
+
+
+def load_config():
+    if CONFIG_FILE.is_file():
+        try:
+            return json.loads(CONFIG_FILE.read_text())
+        except Exception as exc:
+            warn(f"cannot parse {CONFIG_FILE}: {exc}; using defaults")
+    return {}
+
+
+def save_config(cfg):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2) + "\n")
+
+
+def scene_name(cfg, override=None):
+    return override or cfg.get("scene") or DEFAULT_SCENE
+
+
+def phone_urls(cfg):
+    facing = "&facing=environment" if cfg.get("back") else ""
+    extra = ""
+    if cfg.get("relay") and not cfg.get("p2p"):
+        extra += "&relay"
+    if cfg.get("p2p"):
+        extra += "&turn=0"
+    codec = cfg.get("codec")
+    push_extra = extra + (f"&prefervideocodec={codec}" if codec else "")
+    view_extra = extra + (f"&codec={codec}" if codec else "")
+    push = PUSH_URL.format(room=cfg.get("room", ""), bitrate=cfg.get("bitrate", 2500),
+                           facing=facing, extra=push_extra)
+    view = VIEW_URL.format(room=cfg.get("room", ""), extra=view_extra)
+    return push, view
+
+
+def lovense_url():
+    return f"http://127.0.0.1:{HTTP_PORT}/?from=smart&port={RELAY_PORT}#/home"
+
+
+def widget_dirs():
+    env = os.environ.get("PHONECAM_WIDGET_DIR")
+    if env:
+        yield Path(env)
+    yield DATA_DIR / "widget"
+    yield SCRIPT_DIR / "widget"
+    yield Path("/usr/share/phonecam/widget")
+
+
+def find_widget():
+    for candidate in widget_dirs():
+        if (candidate / "index.html").is_file():
+            return candidate
+    return None
+
+
+def widget_version(path):
+    try:
+        for entry in sorted(path.glob("*.txt")):
+            text = entry.read_text(errors="replace").strip()
+            if re.fullmatch(r"\d+(?:\.\d+)+", text):
+                return text
+    except Exception:
+        pass
+    return "unknown"
+
+
+def make_qr(text):
+    if not have("qrencode"):
+        return None
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    target = CONFIG_DIR / "qr.png"
+    try:
+        subprocess.run(["qrencode", "-s", "10", "-m", "4", "-o", str(target), text],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        return None
+    return target
+
+
+def print_qr_ansi(text):
+    if not have("qrencode"):
+        warn("qrencode is not installed, cannot draw the QR code in the terminal")
+        return
+    try:
+        result = subprocess.run(["qrencode", "-t", "ANSIUTF8", "-m", "2", text],
+                                capture_output=True, text=True, check=True)
+        say(result.stdout)
+    except subprocess.CalledProcessError as exc:
+        warn(f"qrencode failed: {exc}")
+
+
+# --------------------------------------------------------------------------
+# obs-websocket: synchronous client for CLI commands
+# --------------------------------------------------------------------------
+
+class ObsError(RuntimeError):
+    pass
+
+
+def obs_websocket_config():
+    if not OBS_WS_CONFIG.is_file():
+        raise ObsError(f"{OBS_WS_CONFIG} not found; start OBS once")
+    try:
+        cfg = json.loads(OBS_WS_CONFIG.read_text())
+    except Exception as exc:
+        raise ObsError(f"cannot read {OBS_WS_CONFIG}: {exc}") from exc
+    if not cfg.get("server_enabled"):
+        raise ObsError("obs-websocket is disabled; run: phonecam phone enable-ws (then restart OBS)")
+    return cfg
+
+
+class Obs:
+    """Minimal synchronous obs-websocket v5 client."""
+
+    def __init__(self, timeout=5.0):
+        try:
+            from websockets.sync.client import connect
+        except ImportError as exc:  # pragma: no cover
+            raise ObsError("python-websockets is required") from exc
+        self._cfg = obs_websocket_config()
+        port = int(self._cfg.get("server_port", 4455))
+        self._stack = contextlib.ExitStack()
+        try:
+            self.ws = self._stack.enter_context(
+                connect(f"ws://{RELAY_HOST}:{port}", open_timeout=timeout))
+            hello = json.loads(self.ws.recv(timeout=timeout))["d"]
+        except Exception as exc:
+            self._stack.close()
+            raise ObsError(f"OBS is not reachable on {RELAY_HOST}:{port} ({exc})") from exc
+
+        ident = {"rpcVersion": 1, "eventSubscriptions": 0}
+        auth = hello.get("authentication")
+        if auth:
+            password = self._cfg.get("server_password", "")
+            secret = base64.b64encode(
+                hashlib.sha256((password + auth["salt"]).encode()).digest()).decode()
+            ident["authentication"] = base64.b64encode(
+                hashlib.sha256((secret + auth["challenge"]).encode()).digest()).decode()
+        self.ws.send(json.dumps({"op": 1, "d": ident}))
+        try:
+            response = json.loads(self.ws.recv(timeout=timeout))
+        except Exception as exc:
+            self._stack.close()
+            raise ObsError(f"OBS handshake failed ({exc})") from exc
+        if response.get("op") != 2:
+            self._stack.close()
+            raise ObsError("OBS rejected the connection (wrong password?)")
+        self._request_id = 0
+
+    def call(self, request, timeout=10.0, **data):
+        self._request_id += 1
+        request_id = f"phonecam-{self._request_id}"
+        payload = {"op": 6, "d": {"requestType": request, "requestId": request_id,
+                                  "requestData": data}}
+        self.ws.send(json.dumps(payload))
+        deadline = time.monotonic() + timeout
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise ObsError(f"{request}: timeout")
+            try:
+                raw = self.ws.recv(timeout=left)
+            except TimeoutError as exc:
+                raise ObsError(f"{request}: timeout") from exc
+            message = json.loads(raw)
+            if message.get("op") == 5:
+                continue
+            if message.get("op") == 7 and message["d"].get("requestId") == request_id:
+                status = message["d"].get("requestStatus", {})
+                if not status.get("result"):
+                    raise ObsError(f"{request}: {status.get('comment') or status.get('code')}")
+                return message["d"].get("responseData", {})
+
+    def close(self):
+        self._stack.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def ensure_scene(obs, scene):
+    names = [s["sceneName"] for s in obs.call("GetSceneList").get("scenes", [])]
+    if scene not in names:
+        obs.call("CreateScene", sceneName=scene)
+        return True
+    return False
+
+
+def canvas_size(obs):
+    data = obs.call("GetVideoSettings")
+    return int(data.get("baseWidth", 1920)), int(data.get("baseHeight", 1080))
+
+
+def ensure_browser_source(obs, scene, name, url, width, height, css=None):
+    """Create or update a browser source and make sure it is in the scene.
+
+    Returns (scene_item_id, changed).
+    """
+    inputs = {item["inputName"] for item in obs.call("GetInputList").get("inputs", [])}
+    settings = {
+        "url": url,
+        "width": int(width),
+        "height": int(height),
+        "fps": 30,
+        "shutdown_when_not_visible": False,
+        "restart_when_active": False,
+    }
+    if css is not None:
+        settings["css"] = css
+
+    changed = False
+    if name in inputs:
+        old_url = obs.call("GetInputSettings", inputName=name).get(
+            "inputSettings", {}).get("url")
+        obs.call("SetInputSettings", inputName=name, inputSettings=settings, overlay=True)
+        changed = old_url != url
+    else:
+        obs.call("CreateInput", sceneName=scene, inputName=name,
+                 inputKind="browser_source", inputSettings=settings,
+                 sceneItemEnabled=True)
+        changed = True
+
+    items = obs.call("GetSceneItemList", sceneName=scene).get("sceneItems", [])
+    item = next((i for i in items if i["sourceName"] == name), None)
+    if item is None:
+        obs.call("CreateSceneItem", sceneName=scene, sourceName=name,
+                 sceneItemEnabled=True)
+        items = obs.call("GetSceneItemList", sceneName=scene).get("sceneItems", [])
+        item = next(i for i in items if i["sourceName"] == name)
+        changed = True
+
+    if changed:
+        with contextlib.suppress(ObsError):
+            obs.call("PressInputPropertiesButton", inputName=name,
+                     propertyName="refreshnocache")
+    return item["sceneItemId"], changed
+
+
+def fit_source(obs, scene, item_id):
+    """Scale a source down to fit the canvas and center it."""
+    cw, ch = canvas_size(obs)
+    transform = obs.call("GetSceneItemTransform", sceneName=scene,
+                         sceneItemId=item_id)["sceneItemTransform"]
+    width = transform.get("sourceWidth") or cw
+    height = transform.get("sourceHeight") or ch
+    scale = min(cw / width, ch / height)
+    obs.call("SetSceneItemTransform", sceneName=scene, sceneItemId=item_id,
+             sceneItemTransform={
+                 "positionX": (cw - width * scale) / 2,
+                 "positionY": (ch - height * scale) / 2,
+                 "scaleX": scale,
+                 "scaleY": scale,
+                 "alignment": 5,
+                 "boundsType": "OBS_BOUNDS_NONE",
+                 "rotation": 0.0,
+             })
+    return cw, ch
+
+
+def fill_canvas(obs, scene, item_id):
+    """Stretch a source to the whole canvas (used for the transparent overlay)."""
+    cw, ch = canvas_size(obs)
+    obs.call("SetSceneItemTransform", sceneName=scene, sceneItemId=item_id,
+             sceneItemTransform={
+                 "positionX": 0.0,
+                 "positionY": 0.0,
+                 "scaleX": 1.0,
+                 "scaleY": 1.0,
+                 "alignment": 5,
+                 "boundsType": "OBS_BOUNDS_NONE",
+                 "rotation": 0.0,
+             })
+    return cw, ch
+
+
+# --------------------------------------------------------------------------
+# phone commands
+# --------------------------------------------------------------------------
+
+def phone_apply(cfg, scene, activate=False):
+    push, view = phone_urls(cfg)
+    with Obs() as obs:
+        created = ensure_scene(obs, scene)
+        if created:
+            ok(f"scene created: {scene}")
+        item_id, changed = ensure_browser_source(obs, scene, PHONE_SOURCE, view, 1920, 1080)
+        cw, ch = fit_source(obs, scene, item_id)
+        if activate:
+            obs.call("SetCurrentProgramScene", sceneName=scene)
+        state = "created" if created or changed else "updated"
+        ok(f"OBS source {PHONE_SOURCE} {state} in scene {scene!r} (canvas {cw}x{ch})")
+    return push, view
+
+
+def cmd_phone_new(args):
+    cfg = load_config()
+    if args.room:
+        room = re.sub(r"[^A-Za-z0-9]", "", args.room)
+        if not room:
+            die("room id must contain letters or digits")
+        cfg["room"] = room
+    else:
+        cfg.setdefault("room", "pc" + secrets.token_hex(4))
+    cfg["back"] = bool(args.back)
+    cfg["bitrate"] = args.bitrate
+    cfg["relay"] = bool(args.relay)
+    cfg["p2p"] = bool(args.p2p)
+    cfg["codec"] = args.codec
+    if args.scene:
+        cfg["scene"] = args.scene
+    save_config(cfg)
+    push, view = phone_urls(cfg)
+    say(f"room:    {cfg['room']}")
+    say(f"phone:   {push}")
+    say(f"OBS:     {view}")
+    qr = make_qr(push)
+    if qr:
+        say(f"QR file: {qr}")
+    say()
+    print_qr_ansi(push)
+    if getattr(args, "obs", False):
+        phone_apply(cfg, args.scene, args.activate)
+
+
+def cmd_phone_url(args):
+    cfg = load_config()
+    if not cfg.get("room"):
+        die("no room yet; run: phonecam phone new")
+    push, view = phone_urls(cfg)
+    say(f"phone: {push}")
+    say(f"OBS:   {view}")
+
+
+def cmd_phone_qr(args):
+    cfg = load_config()
+    if not cfg.get("room"):
+        die("no room yet; run: phonecam phone new")
+    push, _ = phone_urls(cfg)
+    qr = make_qr(push)
+    if qr:
+        say(str(qr))
+    print_qr_ansi(push)
+    if args.open and qr:
+        with contextlib.suppress(Exception):
+            subprocess.Popen(["xdg-open", str(qr)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def cmd_phone_obs(args):
+    cfg = load_config()
+    if not cfg.get("room"):
+        die("no room yet; run: phonecam phone new")
+    scene = scene_name(cfg, args.scene)
+    phone_apply(cfg, scene, args.activate)
+
+
+def cmd_phone_refresh(args):
+    with Obs() as obs:
+        inputs = {i["inputName"] for i in obs.call("GetInputList").get("inputs", [])}
+        if PHONE_SOURCE not in inputs:
+            die(f"OBS has no {PHONE_SOURCE} source; run: phonecam phone obs")
+        obs.call("PressInputPropertiesButton", inputName=PHONE_SOURCE,
+                 propertyName="refreshnocache")
+        ok(f"{PHONE_SOURCE} page reloaded (refreshnocache)")
+
+
+def cmd_phone_layout(args):
+    cfg = load_config()
+    scene = scene_name(cfg, args.scene)
+    with Obs() as obs:
+        obs.call("GetSceneList")
+        items = obs.call("GetSceneItemList", sceneName=scene).get("sceneItems", [])
+        item = next((i for i in items if i["sourceName"] == PHONE_SOURCE), None)
+        if item is None:
+            die(f"scene {scene!r} has no {PHONE_SOURCE} source; run: phonecam phone obs")
+        cw, ch = fit_source(obs, scene, item["sceneItemId"])
+        ok(f"{PHONE_SOURCE} fitted to canvas {cw}x{ch} in scene {scene!r}")
+
+
+def cmd_phone_status(args):
+    cfg = load_config()
+    if cfg.get("room"):
+        push, view = phone_urls(cfg)
+        say(f"room:    {cfg['room']}   relay={'on' if cfg.get('relay') else 'off'} "
+            f"p2p={'on' if cfg.get('p2p') else 'off'} codec={cfg.get('codec')}")
+        say(f"OBS URL: {view}")
+    else:
+        warn("no room configured; run: phonecam phone new")
+    try:
+        with Obs() as obs:
+            inputs = {i["inputName"] for i in obs.call("GetInputList").get("inputs", [])}
+            if PHONE_SOURCE not in inputs:
+                warn(f"OBS has no {PHONE_SOURCE} source; run: phonecam phone obs")
+            else:
+                current = obs.call("GetInputSettings", inputName=PHONE_SOURCE).get(
+                    "inputSettings", {}).get("url")
+                say(f"in OBS:  {current}")
+            say(f"scene:   {obs.call('GetCurrentProgramScene').get('currentProgramSceneName')}")
+    except ObsError as exc:
+        warn(str(exc))
+    health = relay_health()
+    if health:
+        ok(f"Lovense relay: panels={health.get('relay', {}).get('panels', 0)} "
+           f"widgets={health.get('relay', {}).get('widgets', 0)}")
+
+
+def cmd_phone_all(args):
+    cmd_phone_new(args)
+    cfg = load_config()
+    phone_apply(cfg, scene_name(cfg, args.scene), args.activate)
+
+
+def cmd_phone_enable_ws(args):
+    if not OBS_WS_CONFIG.is_file():
+        die(f"{OBS_WS_CONFIG} not found; start OBS once")
+    cfg = json.loads(OBS_WS_CONFIG.read_text())
+    if cfg.get("server_enabled"):
+        ok("obs-websocket is already enabled")
+        return
+    cfg["server_enabled"] = True
+    OBS_WS_CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
+    ok("obs-websocket enabled in the config; restart OBS to apply")
+
+
+# --------------------------------------------------------------------------
+# Lovense relay: crypto helpers
+# --------------------------------------------------------------------------
+
+def encrypt(payload):
+    if not HAVE_CRYPTO:
+        raise RuntimeError("python-cryptography is required")
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+    padder = _padding.PKCS7(128).padder()
+    raw = padder.update(raw) + padder.finalize()
+    encryptor = _Cipher(_algorithms.AES(AES_KEY), _modes.CBC(AES_IV)).encryptor()
+    return base64.b64encode(encryptor.update(raw) + encryptor.finalize()).decode()
+
+
+def decrypt(text):
+    if not HAVE_CRYPTO:
+        raise RuntimeError("python-cryptography is required")
+    data = base64.b64decode(text)
+    decryptor = _Cipher(_algorithms.AES(AES_KEY), _modes.CBC(AES_IV)).decryptor()
+    raw = decryptor.update(data) + decryptor.finalize()
+    unpadder = _padding.PKCS7(128).unpadder()
+    return json.loads((unpadder.update(raw) + unpadder.finalize()).decode())
+
+
+def parse_message(raw):
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    with contextlib.suppress(Exception):
+        return decrypt(raw), "aes"
+    with contextlib.suppress(Exception):
+        return json.loads(base64.b64decode(raw).decode()), "b64"
+    with contextlib.suppress(Exception):
+        return json.loads(raw), "json"
+    return None, "unknown"
+
+
+_last_log = {}
+
+
+def log(message):
+    print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
+
+
+def log_slow(key, message, period=60.0):
+    now = time.monotonic()
+    if now - _last_log.get(key, 0.0) < period:
+        return
+    _last_log[key] = now
+    log(message)
+
+
+# --------------------------------------------------------------------------
+# Lovense relay: async OBS client
+# --------------------------------------------------------------------------
+
+class AsyncObs:
+    """Reconnecting obs-websocket client used by the relay."""
+
+    def __init__(self, host, port, password):
+        self.url = f"ws://{host}:{port}"
+        self.password = password or ""
+        self._ws = None
+        self._reader = None
+        self._pending = {}
+        self._lock = asyncio.Lock()
+        self._retry_at = 0.0
+        self.connected = False
+        self.last_error = ""
+
+    @classmethod
+    def from_config(cls):
+        cfg = obs_websocket_config()
+        return cls(RELAY_HOST, int(cfg.get("server_port", 4455)),
+                   cfg.get("server_password", ""))
+
+    async def ensure(self):
+        if self.connected:
+            return True
+        async with self._lock:
+            if self.connected:
+                return True
+            if time.monotonic() < self._retry_at:
+                return False
+            try:
+                await self._handshake()
+                return True
+            except Exception as exc:
+                self.last_error = str(exc)
+                self._retry_at = time.monotonic() + 10.0
+                return False
+
+    async def _handshake(self):
+        ws = await websockets.connect(self.url, open_timeout=3, max_size=None,
+                                      ping_interval=20, ping_timeout=20)
+        try:
+            hello = json.loads(await asyncio.wait_for(ws.recv(), 3))["d"]
+            ident = {"rpcVersion": 1, "eventSubscriptions": 0}
+            auth = hello.get("authentication")
+            if auth:
+                secret = base64.b64encode(
+                    hashlib.sha256((self.password + auth["salt"]).encode()).digest()).decode()
+                ident["authentication"] = base64.b64encode(
+                    hashlib.sha256((secret + auth["challenge"]).encode()).digest()).decode()
+            await ws.send(json.dumps({"op": 1, "d": ident}))
+            response = json.loads(await asyncio.wait_for(ws.recv(), 3))
+            if response.get("op") != 2:
+                raise RuntimeError("obs-websocket rejected the connection")
+        except Exception:
+            await ws.close()
+            raise
+        self._ws = ws
+        self.connected = True
+        self.last_error = ""
+        self._reader = asyncio.create_task(self._read(ws))
+
+    async def _read(self, ws):
+        try:
+            async for raw in ws:
+                try:
+                    message = json.loads(raw)
+                except Exception:
+                    continue
+                if message.get("op") == 7:
+                    future = self._pending.pop(message["d"].get("requestId"), None)
+                    if future and not future.done():
+                        future.set_result(message["d"])
+        except Exception:
+            pass
+        finally:
+            self.connected = False
+            self._ws = None
+            for future in self._pending.values():
+                if not future.done():
+                    future.set_exception(ObsError("OBS connection lost"))
+            self._pending.clear()
+
+    async def call(self, request, timeout=2.0, **data):
+        if not await self.ensure():
+            raise ObsError(self.last_error or "OBS is not connected")
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        request_id = f"relay-{uuid.uuid4()}"
+        self._pending[request_id] = future
+        try:
+            await self._ws.send(json.dumps({
+                "op": 6,
+                "d": {"requestType": request, "requestId": request_id,
+                      "requestData": data},
+            }))
+            message = await asyncio.wait_for(future, timeout)
+        finally:
+            self._pending.pop(request_id, None)
+        status = message.get("requestStatus", {})
+        if not status.get("result"):
+            raise ObsError(f"{request}: {status.get('comment') or status.get('code')}")
+        return message.get("responseData", {})
+
+
+async def obs_answer(obs, request_type):
+    """Turn a Lovense Toolset request into live OBS data."""
+    if request_type in ("GetOBSApplicationShowStatus", "ActiveOBSCamera",
+                        "ShowOBSApplication"):
+        return {"show": True}
+    if request_type == "GetSceneList":
+        data = await obs.call("GetSceneList")
+        result = {"scenes": [{"name": scene["sceneName"]}
+                             for scene in data.get("scenes", []) if scene.get("sceneName")]}
+        current = data.get("currentProgramSceneName")
+        if current:
+            result["currentScene"] = current
+        return result
+    if request_type == "GetStreamingStatus":
+        stream, record, virtual = await asyncio.gather(
+            obs.call("GetStreamStatus"), obs.call("GetRecordStatus"),
+            obs.call("GetVirtualCamStatus"))
+        return {"streaming": bool(stream.get("outputActive")),
+                "recording": bool(record.get("outputActive")),
+                "isVirtualCam": bool(virtual.get("outputActive"))}
+    if request_type == "GetStreamSettings":
+        return {"settings": {}}
+    if request_type == "GetVirtualCamStatus":
+        return {"isVirtualCam": bool((await obs.call("GetVirtualCamStatus")).get("outputActive"))}
+    if request_type == "GetRecordingStatus":
+        active = bool((await obs.call("GetRecordStatus")).get("outputActive"))
+        return {"recording": active, "isRecording": active}
+    if request_type == "GetCurrentScene":
+        data = await obs.call("GetCurrentProgramScene")
+        return {"scene": {"name": data.get("currentProgramSceneName", "")}}
+    if request_type == "GetStudioModeStatus":
+        return {"studioMode": bool((await obs.call("GetStudioModeEnabled")).get("studioModeEnabled"))}
+    if request_type in ("StartVirtualCam", "StopVirtualCam", "StartStreaming",
+                        "StopStreaming", "StartRecording", "StopRecording",
+                        "StartReplayBuffer", "StopReplayBuffer"):
+        await obs.call(request_type)
+        return {}
+    return {}
+
+
+async def answer_request(obs, message):
+    request_type = message.get("request_type", "")
+    response = {"message_id": message.get("message_id"), "status": "ok"}
+    if obs is not None:
+        try:
+            response.update(await obs_answer(obs, request_type))
+            return request_type, response
+        except Exception as exc:
+            log(f"OBS {request_type}: {exc} (fallback)")
+    response.update(DEFAULT_RESPONSES.get(request_type, {}))
+    return request_type, response
+
+
+# --------------------------------------------------------------------------
+# Lovense relay: state and handlers
+# --------------------------------------------------------------------------
+
+class RelayState:
+    def __init__(self):
+        self.widgets = set()
+        self.panels = set()
+        self.last_switch = None
+        self.started = time.time()
+
+
+SWITCH_MESSAGE = {
+    "type": "101",
+    "to": UID,
+    "from": "cam",
+    "data": {"type": "switchConnectClient",
+             "data": {"value": "obs", "version": "31.6.9"}},
+}
+
+
+def panel_hello(state):
+    return {
+        "type": "105",
+        "to": UID,
+        "data": {
+            "version": "1.0.0",
+            "toolSetVersion": "3.0.1",
+            "connect": 2,  # 1=lvs-obs, 2=obs, 3=splitcam, 4=streamster
+            "smartOnline": bool(state.widgets),
+            "pcId": UID,
+            "camName": "OBS",
+            "setCamEmail": UID,
+            "resolutionRatio": "16:9",
+            "frameRate": 30,
+            "stream_v": "1.0.0",
+            "video_snapshot_version": "1.0.0",
+            "fdSupport": False,
+            "handSupport": False,
+            "vibeMateTipMotionSupport": "1",
+            "stream": {"record_status": 0, "record_dir": ""},
+            "system_info": {"cpuName": ""},
+        },
+    }
+
+
+def widget_hello():
+    return {
+        "type": "105",
+        "to": UID,
+        "data": {
+            "version": "1.0.0",
+            "toolSetVersion": "3.0.1",
+            "smartOnline": True,
+            "pcId": UID,
+            "setCamEmail": UID,
+        },
+    }
+
+
+async def relay_handler(connection, state, obs):
+    path = connection.request.path
+    query = path.split("?", 1)[1] if "?" in path else ""
+    params = dict(part.split("=", 1) for part in query.split("&") if "=" in part)
+    origin = params.get("from", "")
+
+    hello_task = None
+    if origin == "smart":
+        state.widgets.add(connection)
+        log(f"widget connected ({len(state.widgets)} online)")
+        with contextlib.suppress(Exception):
+            await connection.send(encrypt(widget_hello()))
+            await connection.send(encrypt(state.last_switch or SWITCH_MESSAGE))
+    elif origin == "cam":
+        state.panels.add(connection)
+        log(f"panel connected ({len(state.panels)} online)")
+        with contextlib.suppress(Exception):
+            await connection.send(encrypt(panel_hello(state)))
+
+        async def hello_loop():
+            while True:
+                await asyncio.sleep(4)
+                try:
+                    await connection.send(encrypt(panel_hello(state)))
+                    log_slow("hello_repeat", "panel hello repeated", 60.0)
+                except Exception:
+                    return
+
+        hello_task = asyncio.create_task(hello_loop())
+
+    try:
+        async for raw in connection:
+            message, method = parse_message(raw)
+            if message is None:
+                log(f"bad frame from {origin or 'unknown'} ({method})")
+                continue
+
+            mtype = str(message.get("type"))
+            if mtype not in ("101", "103", "105", "110", "202", "209", "360"):
+                log_slow(("msg", origin, mtype),
+                         f"message from={origin} type={mtype} method={method}")
+
+            if mtype == "103":
+                reply = {"type": "103", "to": UID,
+                         "from": "cam" if origin == "smart" else "smart"}
+                with contextlib.suppress(Exception):
+                    await connection.send(encrypt(reply))
+                continue
+
+            if origin == "cam" and message.get("request_type"):
+                request_type, response = await answer_request(obs, message)
+                log(f"OBS request {request_type} -> "
+                    f"{json.dumps(response, ensure_ascii=False)[:180]}")
+                with contextlib.suppress(Exception):
+                    await connection.send(encrypt(response))
+                with contextlib.suppress(Exception):
+                    if request_type in ("ActiveOBSCamera", "ShowOBSApplication"):
+                        await connection.send(encrypt({
+                            "update_type": "OBSApplicationShowChanged", "show": True}))
+                    elif request_type == "GetSceneList":
+                        scenes = response.get("scenes", [])
+                        await connection.send(encrypt({
+                            "update_type": "ScenesChanged", "scenes": scenes}))
+                continue
+
+            if origin == "cam" and mtype == "105":
+                with contextlib.suppress(Exception):
+                    await connection.send(encrypt(message))
+                continue
+
+            if origin == "smart":
+                for panel in list(state.panels):
+                    try:
+                        await panel.send(encrypt(message))
+                    except Exception:
+                        state.panels.discard(panel)
+            elif origin == "cam":
+                data = message.get("data")
+                if isinstance(data, dict) and data.get("type") == "switchConnectClient":
+                    state.last_switch = message
+                    log("cached switchConnectClient")
+                for widget in list(state.widgets):
+                    try:
+                        await widget.send(encrypt(message))
+                    except Exception:
+                        state.widgets.discard(widget)
+    except Exception as exc:
+        log(f"connection from {origin or 'unknown'}: {exc}")
+    finally:
+        if hello_task:
+            hello_task.cancel()
+        if connection in state.widgets:
+            state.widgets.discard(connection)
+            log("widget disconnected")
+        if connection in state.panels:
+            state.panels.discard(connection)
+            log("panel disconnected")
+
+
+async def proxy_handler(client):
+    """The extension dials localhost:20996; bridge it to the relay as a panel."""
+    url = f"ws://{RELAY_HOST}:{RELAY_PORT}/smartcam/ws?from=cam"
+    try:
+        relay = await websockets.connect(url, max_size=None, ping_interval=None,
+                                         open_timeout=5)
+    except Exception as exc:
+        log(f"proxy: relay unavailable ({exc})")
+        with contextlib.suppress(Exception):
+            await client.close(1011, "relay unavailable")
+        return
+
+    async def pump(source, target):
+        try:
+            async for raw in source:
+                await target.send(raw)
+        except Exception:
+            pass
+
+    tasks = [asyncio.create_task(pump(client, relay)),
+             asyncio.create_task(pump(relay, client))]
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    for task in pending:
+        task.cancel()
+    for task in done:
+        with contextlib.suppress(Exception):
+            task.result()
+    with contextlib.suppress(Exception):
+        await relay.close()
+    with contextlib.suppress(Exception):
+        await client.close()
+
+
+def relay_health(timeout=1.0):
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{HTTP_PORT}/health",
+                                    timeout=timeout) as response:
+            return json.loads(response.read().decode())
+    except Exception:
+        return None
+
+
+def http_app(state, obs, widget):
+    app = _web.Application()
+
+    async def health(request):
+        payload = {
+            "app": APP,
+            "version": VERSION,
+            "uptime": round(time.time() - state.started, 1),
+            "relay": {"port": RELAY_PORT,
+                      "panels": len(state.panels),
+                      "widgets": len(state.widgets)},
+            "obs": {"connected": bool(obs and obs.connected),
+                    "scene": None},
+            "widget": str(widget) if widget else None,
+        }
+        if obs is not None and await obs.ensure():
+            payload["obs"]["connected"] = True
+            with contextlib.suppress(Exception):
+                data = await obs.call("GetCurrentProgramScene", timeout=1)
+                payload["obs"]["scene"] = data.get("currentProgramSceneName")
+        return _web.json_response(payload)
+
+    async def static(request):
+        if widget is None:
+            return _web.Response(status=503, text="Lovense widget is not installed\n")
+        relative = request.match_info.get("path", "").lstrip("/")
+        base = widget.resolve()
+        target = (base / relative).resolve() if relative else base / "index.html"
+        if not target.is_relative_to(base):
+            raise _web.HTTPForbidden()
+        if target.is_dir():
+            target = target / "index.html"
+        if not target.is_file():
+            if "." in Path(relative).name:
+                raise _web.HTTPNotFound()
+            target = base / "index.html"
+        return _web.FileResponse(target)
+
+    app.router.add_get("/health", health)
+    app.router.add_get("/{path:.*}", static)
+    return app
+
+
+async def run_relay():
+    if websockets is None:
+        die("python-websockets is required for the relay")
+    if not HAVE_AIOHTTP:
+        die("python-aiohttp is required for the relay")
+    if not HAVE_CRYPTO:
+        die("python-cryptography is required for the relay")
+
+    widget = find_widget()
+    if widget is None:
+        warn("Lovense widget not installed; /health will work but OBS will show nothing")
+        warn("run: phonecam lovense setup")
+    else:
+        log(f"widget: {widget} ({widget_version(widget)})")
+
+    try:
+        obs = AsyncObs.from_config()
+    except ObsError as exc:
+        log(f"OBS integration disabled: {exc}")
+        obs = None
+
+    state = RelayState()
+    runner = _web.AppRunner(http_app(state, obs, widget))
+    await runner.setup()
+    await _web.TCPSite(runner, RELAY_HOST, HTTP_PORT).start()
+    log(f"http: http://{RELAY_HOST}:{HTTP_PORT}/ (widget, /health)")
+
+    proxy_servers = []
+    for host in (RELAY_HOST, "::1"):
+        try:
+            proxy_servers.append(await websockets.serve(
+                proxy_handler, host, PROXY_PORT, max_size=None, ping_interval=None))
+        except OSError as exc:
+            log(f"proxy bind {host}:{PROXY_PORT} failed: {exc}")
+    if not proxy_servers:
+        await runner.cleanup()
+        die(f"cannot bind proxy port {PROXY_PORT}")
+
+    handler = functools.partial(relay_handler, state=state, obs=obs)
+    try:
+        async with websockets.serve(handler, RELAY_HOST, RELAY_PORT,
+                                    max_size=None, ping_interval=None):
+            log(f"relay listening on ws://{RELAY_HOST}:{RELAY_PORT}/smartcam/ws")
+            log(f"proxy listening on ws://{RELAY_HOST}:{PROXY_PORT} (panel)")
+            await asyncio.Future()
+    finally:
+        for server in proxy_servers:
+            server.close()
+            await server.wait_closed()
+        await runner.cleanup()
+
+
+# --------------------------------------------------------------------------
+# Lovense: install widget and extension
+# --------------------------------------------------------------------------
+
+def download(url, destination, label):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    say(f"downloading {label} ...")
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    partial = destination.with_suffix(destination.suffix + ".part")
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response, \
+                open(partial, "wb") as output:
+            total = int(response.headers.get("Content-Length") or 0)
+            done = 0
+            while True:
+                chunk = response.read(1024 * 256)
+                if not chunk:
+                    break
+                output.write(chunk)
+                done += len(chunk)
+                if total and done % (8 * 1024 * 1024) < 1024 * 256:
+                    say(f"  {human_size(done)} / {human_size(total)}")
+        partial.replace(destination)
+    except Exception as exc:
+        partial.unlink(missing_ok=True)
+        die(f"download failed: {exc}")
+    return destination
+
+
+def extract_widget(installer, destination):
+    if not have("7z"):
+        die("7z is required to unpack the Lovense installer (install p7zip)")
+    say(f"unpacking {installer.name} ...")
+    with tempfile.TemporaryDirectory(prefix="phonecam-") as tmp:
+        result = subprocess.run(["7z", "x", "-y", f"-o{tmp}", str(installer)],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if result.returncode != 0:
+            die(f"7z failed: {result.stderr.decode(errors='replace').strip()}")
+        candidates = sorted(Path(tmp).rglob("dist/index.html"))
+        if not candidates:
+            die("no widget (dist/index.html) found inside the installer")
+        source = candidates[0].parent
+        destination.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source, destination, dirs_exist_ok=True)
+    ok(f"widget installed: {destination} ({widget_version(destination)})")
+
+
+def cmd_lovense_setup(args):
+    widget = find_widget()
+    if args.installer:
+        installer = Path(args.installer).expanduser()
+        if not installer.is_file():
+            die(f"installer not found: {installer}")
+        target = Path(args.to).expanduser() if args.to else DATA_DIR / "widget"
+        extract_widget(installer, target)
+        return
+    if widget is not None and not args.download:
+        ok(f"widget already installed: {widget} ({widget_version(widget)})")
+        say("  use --download to refresh it from the official installer")
+        return
+    target = Path(args.to).expanduser() if args.to else DATA_DIR / "widget"
+    installer = CACHE_DIR / "Lovense_OBS_Toolset_x64.exe"
+    if not installer.is_file() or args.force:
+        download(TOOLSET_URL, installer, "Lovense OBS Toolset (~81 MiB)")
+    else:
+        say(f"using cached installer: {installer}")
+    extract_widget(installer, target)
+
+
+def find_loaded_extension():
+    """Return the unpacked Lovense extension that Chrome has loaded, if any."""
+    roots = [HOME / ".config" / "google-chrome",
+             HOME / ".config" / "google-chrome-beta",
+             HOME / ".config" / "google-chrome-unstable",
+             HOME / ".config" / "chromium"]
+    for root in roots:
+        for prefs in root.glob("*/Preferences"):
+            try:
+                data = json.loads(prefs.read_text())
+            except Exception:
+                continue
+            settings = data.get("extensions", {}).get("settings", {})
+            for entry in settings.values():
+                path = entry.get("path") or ""
+                if "lovense" not in path.lower():
+                    continue
+                candidate = Path(path)
+                if (candidate / "manifest.json").is_file():
+                    return candidate
+    return None
+
+
+def patch_extension(directory):
+    page = directory / "pages" / "chrome_background.html"
+    if not page.is_file():
+        die(f"not an unpacked Lovense extension: {directory}")
+    text = page.read_text()
+    match = re.search(r'allow="([^"]*)"', text)
+    if not match:
+        warn(f"no allow= attribute in {page}; nothing to patch")
+        return False
+    permissions = [part.strip() for part in match.group(1).split(";") if part.strip()]
+    missing = [perm for perm in ("local-network-access", "loopback-network")
+               if perm not in permissions]
+    if not missing:
+        ok("extension already patched for Local Network Access")
+        return False
+    permissions.extend(missing)
+    updated = text[:match.start()] + 'allow="' + ";".join(permissions) + '"' + text[match.end():]
+    page.write_text(updated)
+    ok(f"patched allow= in {page}")
+    return True
+
+
+def install_extension(target, force=False):
+    target = Path(target).expanduser()
+    if target.is_dir() and not force:
+        patch_extension(target)
+        return target
+    archive = CACHE_DIR / "lovense_cam.zip"
+    if not archive.is_file() or force:
+        download(EXTENSION_URL, archive, "Lovense Cam extension (~3.3 MiB)")
+    else:
+        say(f"using cached extension: {archive}")
+    say(f"unpacking {archive.name} ...")
+    target.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(archive) as bundle:
+        bundle.extractall(target)
+    patch_extension(target)
+    return target
+
+
+def cmd_lovense_extension(args):
+    if args.dir:
+        directory = Path(args.dir).expanduser()
+        if not directory.is_dir():
+            die(f"directory not found: {directory}")
+        patch_extension(directory)
+    else:
+        loaded = find_loaded_extension()
+        if loaded is not None and not args.force:
+            ok(f"found the extension loaded by Chrome: {loaded}")
+            changed = patch_extension(loaded)
+            directory = loaded
+            if changed:
+                say()
+                warn("reload the extension in chrome://extensions (click Reload)")
+        else:
+            directory = install_extension(DATA_DIR / "extension", force=args.force)
+            say()
+            say("Load the extension in Chrome:")
+            say("  1. open chrome://extensions")
+            say("  2. enable Developer mode")
+            say(f"  3. Load unpacked -> {directory}")
+            say("  4. keep the folder in place, Chrome loads it from disk")
+    if not chrome_flags_ok():
+        say()
+        warn("Chrome Local Network Access is not disabled yet")
+        say("  run: phonecam doctor   (it explains the fix)")
+
+
+# --------------------------------------------------------------------------
+# Lovense: OBS source, relay control, service
+# --------------------------------------------------------------------------
+
+def lovense_apply(scene, activate=False):
+    widget = find_widget()
+    if widget is None:
+        die("Lovense widget is not installed; run: phonecam lovense setup")
+    with Obs() as obs:
+        created = ensure_scene(obs, scene)
+        if created:
+            ok(f"scene created: {scene}")
+        cw, ch = canvas_size(obs)
+        item_id, changed = ensure_browser_source(
+            obs, scene, LOVENSE_SOURCE, lovense_url(), cw, ch, css=LOVENSE_CSS)
+        fill_canvas(obs, scene, item_id)
+        obs.call("SetSceneItemIndex", sceneName=scene, sceneItemId=item_id,
+                 sceneItemIndex=0)
+        if activate:
+            obs.call("SetCurrentProgramScene", sceneName=scene)
+        state = "created" if changed else "updated"
+        ok(f"OBS source {LOVENSE_SOURCE} {state} in scene {scene!r} "
+           f"(topmost, canvas {cw}x{ch})")
+
+
+def cmd_lovense_obs(args):
+    cfg = load_config()
+    lovense_apply(scene_name(cfg, args.scene), args.activate)
+
+
+def systemctl(*arguments):
+    return subprocess.run(["systemctl", "--user", *arguments],
+                          capture_output=True, text=True)
+
+
+def unit_text():
+    return f"""[Unit]
+Description=phonecam Lovense relay
+After=network.target
+
+[Service]
+Type=simple
+ExecStart={shlex.quote(str(SCRIPT_DIR / 'phonecam'))} lovense relay --foreground
+Restart=on-failure
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def service_install(quiet=False):
+    if not have("systemctl"):
+        die("systemd is not available")
+    SYSTEMD_DIR.mkdir(parents=True, exist_ok=True)
+    UNIT_PATH.write_text(unit_text())
+    legacy = SYSTEMD_DIR / LEGACY_UNIT
+    if legacy.is_file():
+        systemctl("stop", LEGACY_UNIT)
+        systemctl("disable", LEGACY_UNIT)
+        if not quiet:
+            warn(f"legacy unit {LEGACY_UNIT} stopped and disabled "
+                 f"(file kept at {legacy})")
+    systemctl("daemon-reload")
+    systemctl("enable", UNIT_NAME)
+    if not quiet:
+        ok(f"service installed and enabled: {UNIT_PATH}")
+
+
+def service_active():
+    if not UNIT_PATH.is_file():
+        return "not installed"
+    result = systemctl("is-active", UNIT_NAME)
+    return result.stdout.strip() or "unknown"
+
+
+def service_enabled():
+    if not UNIT_PATH.is_file():
+        return False
+    return systemctl("is-enabled", UNIT_NAME).stdout.strip() == "enabled"
+
+
+def service_uninstall():
+    systemctl("stop", UNIT_NAME)
+    systemctl("disable", UNIT_NAME)
+    if UNIT_PATH.is_file():
+        UNIT_PATH.unlink()
+        ok(f"removed {UNIT_PATH}")
+    systemctl("daemon-reload")
+
+
+def ensure_relay(quiet=False):
+    health = relay_health()
+    if health and health.get("app") == APP:
+        if not quiet:
+            ok(f"relay already running on port {HTTP_PORT}")
+        return True
+    if not UNIT_PATH.is_file() or UNIT_PATH.read_text() != unit_text():
+        service_install(quiet=True)
+    result = systemctl("start", UNIT_NAME)
+    if result.returncode != 0:
+        warn(f"could not start service: {(result.stderr or result.stdout).strip()}")
+    for _ in range(40):
+        health = relay_health(0.3)
+        if health and health.get("app") == APP:
+            if not quiet:
+                ok(f"relay started (service {UNIT_NAME})")
+            return True
+        time.sleep(0.25)
+    warn(f"relay did not answer on http://127.0.0.1:{HTTP_PORT}/health")
+    return False
+
+
+def cmd_lovense_service(args):
+    if args.action == "install":
+        service_install()
+        say("  start:   phonecam lovense start")
+    elif args.action == "uninstall":
+        service_uninstall()
+        ok("service stopped and removed")
+    elif args.action == "status":
+        say(f"unit:    {UNIT_PATH} ({'present' if UNIT_PATH.is_file() else 'missing'})")
+        say(f"active:  {service_active()}")
+        say(f"enabled: {'yes' if service_enabled() else 'no'}")
+
+
+def cmd_lovense_start(args):
+    if ensure_relay():
+        health = relay_health() or {}
+        relay = health.get("relay", {})
+        ok(f"panels={relay.get('panels', 0)} widgets={relay.get('widgets', 0)} "
+           f"http://127.0.0.1:{HTTP_PORT}/")
+
+
+def cmd_lovense_stop(args):
+    if not UNIT_PATH.is_file():
+        warn("service is not installed")
+        return
+    systemctl("stop", UNIT_NAME)
+    ok("relay stopped")
+
+
+def cmd_lovense_restart(args):
+    ensure_relay(quiet=True)
+    systemctl("restart", UNIT_NAME)
+    for _ in range(40):
+        if relay_health(0.3):
+            ok("relay restarted")
+            return
+        time.sleep(0.25)
+    warn("relay did not come back")
+
+
+def cmd_lovense_status(args):
+    widget = find_widget()
+    if widget:
+        ok(f"widget: {widget} ({widget_version(widget)})")
+    else:
+        warn("widget: not installed (phonecam lovense setup)")
+    say(f"service: {service_active()} (enabled: {'yes' if service_enabled() else 'no'})")
+    health = relay_health()
+    if not health:
+        warn(f"relay: not answering on http://127.0.0.1:{HTTP_PORT}/health")
+        return
+    relay = health.get("relay", {})
+    say(f"relay:   up {health.get('uptime')}s, panels={relay.get('panels', 0)}, "
+        f"widgets={relay.get('widgets', 0)}")
+    obs = health.get("obs", {})
+    say(f"OBS:     {'connected' if obs.get('connected') else 'not connected'}"
+        + (f", scene {obs.get('scene')}" if obs.get("scene") else ""))
+
+
+def cmd_lovense_relay(args):
+    try:
+        asyncio.run(run_relay())
+    except KeyboardInterrupt:
+        say("relay stopped")
+
+
+# --------------------------------------------------------------------------
+# doctor
+# --------------------------------------------------------------------------
+
+def chrome_flags_ok():
+    if not CHROME_FLAGS.is_file():
+        return False
+    for line in CHROME_FLAGS.read_text(errors="replace").splitlines():
+        line = line.strip()
+        if line.startswith("#"):
+            continue
+        if "LocalNetworkAccessChecks" in line:
+            return True
+    return False
+
+
+def cmd_doctor(args):
+    say(f"{APP} {VERSION} doctor")
+    problems = 0
+
+    cfg = load_config()
+    if cfg.get("room"):
+        ok(f"config: {CONFIG_FILE} (room {cfg['room']})")
+    else:
+        warn("config: no room yet (phonecam phone new)")
+        problems += 1
+
+    missing = []
+    versions = []
+    if websockets is None:
+        missing.append("python-websockets")
+    else:
+        versions.append(f"websockets {getattr(websockets, '__version__', '?')}")
+    if not HAVE_AIOHTTP:
+        missing.append("python-aiohttp")
+    else:
+        import aiohttp
+        versions.append(f"aiohttp {aiohttp.__version__}")
+    if not HAVE_CRYPTO:
+        missing.append("python-cryptography")
+    else:
+        import cryptography
+        versions.append(f"cryptography {cryptography.__version__}")
+    if missing:
+        fail("python: missing " + ", ".join(missing))
+        problems += 1
+    else:
+        ok("python: " + ", ".join(versions))
+
+    for binary, hint in (("qrencode", "terminal QR codes"),
+                         ("7z", "unpacking the Lovense installer")):
+        if have(binary):
+            ok(f"{binary}: {shutil.which(binary)} ({hint})")
+        else:
+            warn(f"{binary}: not found ({hint})")
+
+    widget = find_widget()
+    if widget:
+        ok(f"widget: {widget} ({widget_version(widget)})")
+    else:
+        fail("widget: not installed (phonecam lovense setup)")
+        problems += 1
+
+    health = relay_health()
+    if health and health.get("app") == APP:
+        relay = health.get("relay", {})
+        ok(f"relay: http://127.0.0.1:{HTTP_PORT}/health, "
+           f"panels={relay.get('panels', 0)}, widgets={relay.get('widgets', 0)}")
+    else:
+        warn("relay: not running (phonecam lovense start)")
+        problems += 1
+
+    say(f"service: {service_active()} (enabled: {'yes' if service_enabled() else 'no'})")
+
+    try:
+        with Obs() as obs:
+            inputs = {i["inputName"] for i in obs.call("GetInputList").get("inputs", [])}
+            scenes = [s["sceneName"] for s in obs.call("GetSceneList").get("scenes", [])]
+            current = obs.call("GetCurrentProgramScene").get("currentProgramSceneName")
+            ok(f"obs: connected, scene {current!r}, scenes={len(scenes)}")
+            for name in (PHONE_SOURCE, LOVENSE_SOURCE):
+                if name in inputs:
+                    ok(f"obs source: {name}")
+                else:
+                    warn(f"obs source: {name} missing (phonecam lovense obs / phonecam phone obs)")
+    except ObsError as exc:
+        warn(f"obs: {exc}")
+        problems += 1
+
+    extension = find_loaded_extension()
+    if extension is None:
+        candidate = DATA_DIR / "extension"
+        extension = candidate if (candidate / "manifest.json").is_file() else None
+    if extension is not None:
+        page = extension / "pages" / "chrome_background.html"
+        if page.is_file() and "local-network-access" in page.read_text():
+            ok(f"extension: {extension} (patched)")
+        else:
+            fail(f"extension: {extension} is not patched (phonecam lovense extension)")
+            problems += 1
+    else:
+        warn("extension: no unpacked Lovense extension found "
+             "(phonecam lovense extension)")
+
+    if chrome_flags_ok():
+        ok(f"chrome LNA: disabled via {CHROME_FLAGS}")
+    else:
+        fail(f"chrome LNA: not disabled (needs {CHROME_FLAGS})")
+        say('  add this line: --disable-features=LocalNetworkAccessChecks')
+        problems += 1
+
+    say()
+    if problems:
+        warn(f"{problems} thing(s) to fix")
+    else:
+        ok("everything looks good")
+
+
+# --------------------------------------------------------------------------
+# start
+# --------------------------------------------------------------------------
+
+def cmd_start(args):
+    cfg = load_config()
+    if not cfg.get("room"):
+        cfg["room"] = "pc" + secrets.token_hex(4)
+        save_config(cfg)
+        warn(f"new room created: {cfg['room']}")
+
+    say(f"{APP} {VERSION}")
+    say(f"room: {cfg['room']}")
+
+    widget = find_widget()
+    if widget:
+        ok(f"widget: {widget} ({widget_version(widget)})")
+    else:
+        warn("widget: not installed (phonecam lovense setup)")
+        say("        OBS will only show the phone feed")
+
+    ensure_relay()
+
+    scene = scene_name(cfg, args.scene)
+    if not args.no_obs:
+        try:
+            push, view = phone_urls(cfg)
+            with Obs() as obs:
+                ensure_scene(obs, scene)
+                item_id, _ = ensure_browser_source(obs, scene, PHONE_SOURCE, view,
+                                                   1920, 1080)
+                fit_source(obs, scene, item_id)
+                if widget is not None:
+                    cw, ch = canvas_size(obs)
+                    item_id, _ = ensure_browser_source(
+                        obs, scene, LOVENSE_SOURCE, lovense_url(), cw, ch,
+                        css=LOVENSE_CSS)
+                    fill_canvas(obs, scene, item_id)
+                    obs.call("SetSceneItemIndex", sceneName=scene,
+                             sceneItemId=item_id, sceneItemIndex=0)
+                if not args.no_activate:
+                    obs.call("SetCurrentProgramScene", sceneName=scene)
+            ok(f"OBS sources ready in scene {scene!r}")
+        except ObsError as exc:
+            warn(f"OBS: {exc}")
+        except Exception as exc:
+            warn(f"OBS: unexpected error: {exc}")
+
+    push, view = phone_urls(cfg)
+    say()
+    say(f"phone: {push}")
+    say(f"OBS:   {view}")
+    health = relay_health() or {}
+    relay = health.get("relay", {})
+    say(f"relay: http://127.0.0.1:{HTTP_PORT}/ "
+        f"panels={relay.get('panels', 0)} widgets={relay.get('widgets', 0)}")
+    if not args.no_qr:
+        qr = make_qr(push)
+        if qr:
+            say(f"QR file: {qr}")
+        say()
+        print_qr_ansi(push)
+
+
+# --------------------------------------------------------------------------
+# argument parsing
+# --------------------------------------------------------------------------
+
+ALIASES = {"new", "url", "qr", "obs", "all", "refresh", "layout", "status",
+           "enable-ws"}
+
+
+def add_phone_new_arguments(parser):
+    parser.add_argument("--room", help="VDO.Ninja room id (default: random)")
+    parser.add_argument("--back", action="store_true", help="use the rear camera")
+    parser.add_argument("--no-relay", dest="relay", action="store_false",
+                        default=True, help="do not force the TURN relay")
+    parser.add_argument("--p2p", action="store_true",
+                        help="peer-to-peer only, no TURN")
+    parser.add_argument("--codec", choices=["vp8", "vp9", "h264", "av1"],
+                        help="preferred video codec")
+    parser.add_argument("--bitrate", type=int, default=2500)
+    parser.add_argument("--scene", help="OBS scene name")
+    parser.add_argument("--activate", action="store_true",
+                        help="switch OBS to this scene")
+    parser.add_argument("--obs", action="store_true",
+                        help="create the OBS source right away")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog=APP, description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Aliases: " + ", ".join(sorted(ALIASES)))
+    parser.add_argument("--version", action="version", version=f"{APP} {VERSION}")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    start = sub.add_parser("start", help="start relay and prepare OBS sources")
+    start.add_argument("--scene", help="OBS scene name")
+    start.add_argument("--no-obs", action="store_true", help="do not touch OBS")
+    start.add_argument("--no-activate", action="store_true",
+                       help="do not switch the program scene")
+    start.add_argument("--no-qr", action="store_true", help="do not draw the QR")
+    start.set_defaults(func=cmd_start)
+
+    doctor = sub.add_parser("doctor", help="check the environment")
+    doctor.set_defaults(func=cmd_doctor)
+
+    # ---- phone ----
+    phone = sub.add_parser("phone", help="phone camera commands")
+    phone_sub = phone.add_subparsers(dest="phone_command", required=True)
+
+    new = phone_sub.add_parser("new", help="create a room and show the QR")
+    add_phone_new_arguments(new)
+    new.set_defaults(func=cmd_phone_new)
+
+    url = phone_sub.add_parser("url", help="print the room URLs")
+    url.set_defaults(func=cmd_phone_url)
+
+    qr = phone_sub.add_parser("qr", help="regenerate the QR code")
+    qr.add_argument("--open", action="store_true", help="open the PNG")
+    qr.set_defaults(func=cmd_phone_qr)
+
+    obs = phone_sub.add_parser("obs", help="create or update the browser source")
+    obs.add_argument("--scene", help="OBS scene name")
+    obs.add_argument("--activate", action="store_true")
+    obs.set_defaults(func=cmd_phone_obs)
+
+    refresh = phone_sub.add_parser("refresh", help="reload the browser source")
+    refresh.set_defaults(func=cmd_phone_refresh)
+
+    layout = phone_sub.add_parser("layout", help="fit the source to the canvas")
+    layout.add_argument("--scene", help="OBS scene name")
+    layout.set_defaults(func=cmd_phone_layout)
+
+    status = phone_sub.add_parser("status", help="show the source state")
+    status.set_defaults(func=cmd_phone_status)
+
+    all_cmd = phone_sub.add_parser("all", help="new + obs")
+    add_phone_new_arguments(all_cmd)
+    all_cmd.set_defaults(func=cmd_phone_all)
+
+    enable_ws = phone_sub.add_parser("enable-ws", help="enable obs-websocket")
+    enable_ws.set_defaults(func=cmd_phone_enable_ws)
+
+    # ---- lovense ----
+    lovense = sub.add_parser("lovense", help="Lovense widget commands")
+    lovense_sub = lovense.add_subparsers(dest="lovense_command", required=True)
+
+    setup = lovense_sub.add_parser("setup", help="install the widget")
+    setup.add_argument("--download", action="store_true",
+                       help="download the official installer even if the widget exists")
+    setup.add_argument("--installer", help="use a local Lovense_OBS_Toolset_x64.exe")
+    setup.add_argument("--to", help="install the widget to this directory")
+    setup.add_argument("--force", action="store_true",
+                       help="ignore the cached installer")
+    setup.set_defaults(func=cmd_lovense_setup)
+
+    extension = lovense_sub.add_parser("extension", help="install or patch the Chrome extension")
+    extension.add_argument("--dir", help="patch this unpacked extension in place")
+    extension.add_argument("--force", action="store_true",
+                           help="download a fresh extension archive")
+    extension.set_defaults(func=cmd_lovense_extension)
+
+    l_obs = lovense_sub.add_parser("obs", help="create or update the widget source")
+    l_obs.add_argument("--scene", help="OBS scene name")
+    l_obs.add_argument("--activate", action="store_true")
+    l_obs.set_defaults(func=cmd_lovense_obs)
+
+    relay = lovense_sub.add_parser("relay", help="run the relay in the foreground")
+    relay.add_argument("--foreground", action="store_true", help=argparse.SUPPRESS)
+    relay.set_defaults(func=cmd_lovense_relay)
+
+    l_start = lovense_sub.add_parser("start", help="start the relay service")
+    l_start.set_defaults(func=cmd_lovense_start)
+
+    l_stop = lovense_sub.add_parser("stop", help="stop the relay service")
+    l_stop.set_defaults(func=cmd_lovense_stop)
+
+    l_restart = lovense_sub.add_parser("restart", help="restart the relay service")
+    l_restart.set_defaults(func=cmd_lovense_restart)
+
+    l_status = lovense_sub.add_parser("status", help="show the relay state")
+    l_status.set_defaults(func=cmd_lovense_status)
+
+    service = lovense_sub.add_parser("service", help="manage the systemd user unit")
+    service.add_argument("action", choices=["install", "uninstall", "status"])
+    service.set_defaults(func=cmd_lovense_service)
+
+    return parser
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in ALIASES:
+        argv.insert(0, "phone")
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        args.func(args)
+    except ObsError as exc:
+        die(str(exc))
+    except KeyboardInterrupt:
+        say("\ninterrupted")
+
+
+if __name__ == "__main__":
+    main()

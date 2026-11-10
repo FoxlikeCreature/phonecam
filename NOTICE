@@ -1,0 +1,28 @@
+Bundled third-party software
+============================
+
+Directory: widget/
+Product:   Lovense Cam OBS widget ("Lovense Video Feedback" / OBS Toolset)
+Version:   2.5.6
+Owner:     Lovense (https://www.lovense.com)
+License:   proprietary, not MIT
+
+The files in widget/ are redistributed unchanged so that phonecam can serve
+the widget locally and work offline. They are the property of Lovense and are
+not covered by the MIT license that applies to the rest of this project.
+
+The files were extracted from the official installer
+Lovense_OBS_Toolset_x64.exe, published by Lovense at:
+
+  https://www.lovense.com/files/apps/cam/obs/Lovense_OBS_Toolset_x64.exe
+
+If you redistribute this repository, keep this notice. If you do not want to
+ship proprietary files, delete widget/ and use:
+
+  phonecam lovense setup --download
+
+which extracts the widget from the official installer at runtime.
+
+The Lovense Cam browser extension itself is NOT bundled. It is downloaded
+from https://www.lovense.com/files/apps/cam/lovense_cam.zip and patched
+locally by `phonecam lovense extension`.
