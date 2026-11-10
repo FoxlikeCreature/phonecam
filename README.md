@@ -3,8 +3,6 @@
 
 **TL;DR:** a Linux replacement for the Splitcam + Lovense Cam widget pipeline used for webcam streaming: the phone is the camera, OBS is the switcher, and the Lovense overlay works the same way.
 
-Two cameras, one OBS scene, zero virtual-camera drivers.
-
 Unofficial project, not affiliated with Lovense or VDO.Ninja. "Lovense" is a trademark of its owner.
 
 phonecam is a small command-line tool with two jobs:
