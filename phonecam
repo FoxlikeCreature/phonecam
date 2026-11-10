@@ -45,9 +45,10 @@ import urllib.request
 import uuid
 import zipfile
 from pathlib import Path
+from urllib.parse import quote
 
 APP = "phonecam"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 HOME = Path.home()
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -81,8 +82,9 @@ EXTENSION_URL = "https://www.lovense.com/files/apps/cam/lovense_cam.zip"
 USER_AGENT = f"{APP}/{VERSION}"
 
 PUSH_URL = ("https://vdo.ninja/?push={room}&webcam&autostart&mobile"
-            "&bitrate={bitrate}{facing}{extra}")
-VIEW_URL = "https://vdo.ninja/?view={room}&cleanoutput&autoplay&showintro=0{extra}"
+            "&bitrate={bitrate}{facing}{extra}{password}")
+VIEW_URL = ("https://vdo.ninja/?view={room}&cleanoutput&autoplay&showintro=0"
+            "{extra}{password}")
 
 DEFAULT_RESPONSES = {
     "GetOBSApplicationShowStatus": {"show": True},
@@ -183,9 +185,12 @@ def phone_urls(cfg):
     codec = cfg.get("codec")
     push_extra = extra + (f"&prefervideocodec={codec}" if codec else "")
     view_extra = extra + (f"&codec={codec}" if codec else "")
+    password = cfg.get("password")
+    auth = f"&password={quote(password)}" if password else ""
     push = PUSH_URL.format(room=cfg.get("room", ""), bitrate=cfg.get("bitrate", 2500),
-                           facing=facing, extra=push_extra)
-    view = VIEW_URL.format(room=cfg.get("room", ""), extra=view_extra)
+                           facing=facing, extra=push_extra, password=auth)
+    view = VIEW_URL.format(room=cfg.get("room", ""), extra=view_extra,
+                           password=auth)
     return push, view
 
 
@@ -457,9 +462,21 @@ def cmd_phone_new(args):
         room = re.sub(r"[^A-Za-z0-9]", "", args.room)
         if not room:
             die("room id must contain letters or digits")
+        new_room = room != cfg.get("room")
         cfg["room"] = room
+    elif not cfg.get("room"):
+        cfg["room"] = "pc" + secrets.token_hex(4)
+        new_room = True
     else:
-        cfg.setdefault("room", "pc" + secrets.token_hex(4))
+        new_room = False
+
+    if args.password is not None:
+        if not re.fullmatch(r"[A-Za-z0-9]{1,49}", args.password):
+            die("password must be 1-49 letters or digits")
+        cfg["password"] = args.password
+    elif new_room or not cfg.get("password"):
+        cfg["password"] = secrets.token_hex(8)
+
     cfg["back"] = bool(args.back)
     cfg["bitrate"] = args.bitrate
     cfg["relay"] = bool(args.relay)
@@ -470,6 +487,7 @@ def cmd_phone_new(args):
     save_config(cfg)
     push, view = phone_urls(cfg)
     say(f"room:    {cfg['room']}")
+    say(f"pass:    {cfg['password']}")
     say(f"phone:   {push}")
     say(f"OBS:     {view}")
     qr = make_qr(push)
@@ -1458,7 +1476,11 @@ def cmd_doctor(args):
 
     cfg = load_config()
     if cfg.get("room"):
-        ok(f"config: {CONFIG_FILE} (room {cfg['room']})")
+        state = "password set" if cfg.get("password") else "no password"
+        ok(f"config: {CONFIG_FILE} (room {cfg['room']}, {state})")
+        if not cfg.get("password"):
+            warn("config: the room has no password (phonecam start adds one)")
+            problems += 1
     else:
         warn("config: no room yet (phonecam phone new)")
         problems += 1
@@ -1564,6 +1586,10 @@ def cmd_start(args):
         cfg["room"] = "pc" + secrets.token_hex(4)
         save_config(cfg)
         warn(f"new room created: {cfg['room']}")
+    if not cfg.get("password"):
+        cfg["password"] = secrets.token_hex(8)
+        save_config(cfg)
+        warn("room password added; scan the QR code again")
 
     say(f"{APP} {VERSION}")
     say(f"room: {cfg['room']}")
@@ -1628,6 +1654,8 @@ ALIASES = {"new", "url", "qr", "obs", "all", "refresh", "layout", "status",
 
 def add_phone_new_arguments(parser):
     parser.add_argument("--room", help="VDO.Ninja room id (default: random)")
+    parser.add_argument("--password",
+                        help="room password, 1-49 letters or digits (default: random)")
     parser.add_argument("--back", action="store_true", help="use the rear camera")
     parser.add_argument("--no-relay", dest="relay", action="store_false",
                         default=True, help="do not force the TURN relay")

@@ -124,7 +124,11 @@ Scan the QR with the phone, open the Lovense panel in Chrome, and stream.
 
 ### Room privacy
 
-The VDO.Ninja room ID is `pc` plus 8 random hex digits (32 bits) and there is no room password. Anyone who learns the ID can view the stream, and it is short enough to be guessed by a determined scanner. Treat the phone URL as private and do not share screenshots of it. You can pick your own longer ID with `phonecam phone new --room <ID>`.
+Every room has a random password (`&password=` in the phone and OBS links). VDO.Ninja uses it to encrypt the signalling handshake and to obscure the room name on its servers, so knowing the room ID alone is not enough to watch the stream.
+
+The password is part of the URL, so the URL itself (and any screenshot of the QR code) is the secret. Keep it out of chat and screenshots.
+
+Older configs without a password get one on the next `phonecam start`; scan the printed QR code again. To set your own, use `phonecam phone new --password <PW>` (1-49 letters and digits) or a longer room ID with `phonecam phone new --room <ID>`.
 
 ## Commands
 
@@ -133,7 +137,7 @@ Main:
 ```
 phonecam start                     relay + OBS sources + QR
 phonecam doctor                    environment diagnostics
-phonecam phone new [--room ID] [--back] [--bitrate 2500] [--scene NAME]
+phonecam phone new [--room ID] [--password PW] [--back] [--bitrate 2500] [--scene NAME]
 phonecam phone qr [--open]         regenerate / open the QR image
 phonecam lovense extension         install / patch the Lovense extension
 phonecam lovense status            relay status (panels, widgets, OBS)
@@ -157,7 +161,7 @@ Old top-level commands (`new`, `url`, `qr`, ...) still work and map to `phonecam
 
 | Path | Purpose |
 |------|---------|
-| `~/.config/phonecam/config.json` | room, bitrate, scene, codec |
+| `~/.config/phonecam/config.json` | room, password, bitrate, scene, codec |
 | `~/.config/phonecam/qr.png` | last QR code |
 | `~/.local/share/phonecam/widget` | widget downloaded with `setup --download` |
 | `~/.local/share/phonecam/extension` | extension downloaded with `lovense extension` |
