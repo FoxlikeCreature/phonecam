@@ -66,7 +66,7 @@ sudo pacman -S python-websockets python-aiohttp python-cryptography qrencode p7z
 ## Install
 
 ```sh
-git clone https://github.com/OWNER/phonecam.git ~/projects/phonecam
+git clone https://github.com/FoxlikeCreature/phonecam.git ~/projects/phonecam
 install -Dm755 ~/projects/phonecam/phonecam ~/.local/bin/phonecam
 ```
 

@@ -6,7 +6,7 @@ pkgver=1.0.0
 pkgrel=1
 pkgdesc="Phone camera and Lovense Cam overlay for OBS"
 arch=('any')
-url="https://github.com/OWNER/phonecam"
+url="https://github.com/FoxlikeCreature/phonecam"
 license=('MIT')
 depends=('python' 'python-websockets' 'python-aiohttp' 'python-cryptography'
          'qrencode' 'p7zip')
