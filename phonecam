@@ -350,7 +350,7 @@ def canvas_size(obs):
     return int(data.get("baseWidth", 1920)), int(data.get("baseHeight", 1080))
 
 
-def ensure_browser_source(obs, scene, name, url, width, height, css=None):
+def ensure_browser_source(obs, scene, name, url, width, height, css=None, fps=30):
     """Create or update a browser source and make sure it is in the scene.
 
     Returns (scene_item_id, changed).
@@ -360,7 +360,7 @@ def ensure_browser_source(obs, scene, name, url, width, height, css=None):
         "url": url,
         "width": int(width),
         "height": int(height),
-        "fps": 30,
+        "fps": int(fps),
         "shutdown_when_not_visible": False,
         "restart_when_active": False,
     }
@@ -1060,7 +1060,11 @@ async def run_relay():
     state = RelayState()
     runner = _web.AppRunner(http_app(state, obs, widget))
     await runner.setup()
-    await _web.TCPSite(runner, RELAY_HOST, HTTP_PORT).start()
+    try:
+        await _web.TCPSite(runner, RELAY_HOST, HTTP_PORT).start()
+    except OSError as exc:
+        await runner.cleanup()
+        die(f"cannot bind HTTP port {HTTP_PORT}: {exc}")
     log(f"http: http://{RELAY_HOST}:{HTTP_PORT}/ (widget, /health)")
 
     proxy_servers = []
@@ -1081,6 +1085,9 @@ async def run_relay():
             log(f"relay listening on ws://{RELAY_HOST}:{RELAY_PORT}/smartcam/ws")
             log(f"proxy listening on ws://{RELAY_HOST}:{PROXY_PORT} (panel)")
             await asyncio.Future()
+    except OSError as exc:
+        log(f"cannot start the relay on {RELAY_HOST}:{RELAY_PORT}: {exc}")
+        raise SystemExit(1) from exc
     finally:
         for server in proxy_servers:
             server.close()
@@ -1263,7 +1270,7 @@ def lovense_apply(scene, activate=False):
             ok(f"scene created: {scene}")
         cw, ch = canvas_size(obs)
         item_id, changed = ensure_browser_source(
-            obs, scene, LOVENSE_SOURCE, lovense_url(), cw, ch, css=LOVENSE_CSS)
+            obs, scene, LOVENSE_SOURCE, lovense_url(), cw, ch, css=LOVENSE_CSS, fps=60)
         fill_canvas(obs, scene, item_id)
         obs.call("SetSceneItemIndex", sceneName=scene, sceneItemId=item_id,
                  sceneItemIndex=0)
@@ -1583,7 +1590,7 @@ def cmd_start(args):
                     cw, ch = canvas_size(obs)
                     item_id, _ = ensure_browser_source(
                         obs, scene, LOVENSE_SOURCE, lovense_url(), cw, ch,
-                        css=LOVENSE_CSS)
+                        css=LOVENSE_CSS, fps=60)
                     fill_canvas(obs, scene, item_id)
                     obs.call("SetSceneItemIndex", sceneName=scene,
                              sceneItemId=item_id, sceneItemIndex=0)
