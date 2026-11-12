@@ -2,7 +2,7 @@
 # Builds the git version. The release PKGBUILD uses a tarball instead of
 # "git+..." in source=().
 pkgname=phonecam-git
-pkgver=1.1.0
+pkgver=1.1.1
 pkgrel=1
 pkgdesc="Phone camera and Lovense Cam overlay for OBS"
 arch=('any')

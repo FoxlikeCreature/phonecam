@@ -48,7 +48,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 APP = "phonecam"
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 HOME = Path.home()
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -870,35 +870,39 @@ def widget_hello():
     }
 
 
+async def send_panel_hello(state):
+    """Ask every panel for its current state.
+
+    Sent once on connect, never repeatedly: the extension answers a hello with
+    a full cache dump, and the widget rebuilds its swiper on every dump, which
+    keeps restarting the carousel autoplay timer.
+    """
+    for panel in list(state.panels):
+        try:
+            await panel.send(encrypt(panel_hello(state)))
+        except Exception:
+            state.panels.discard(panel)
+
+
 async def relay_handler(connection, state, obs):
     path = connection.request.path
     query = path.split("?", 1)[1] if "?" in path else ""
     params = dict(part.split("=", 1) for part in query.split("&") if "=" in part)
     origin = params.get("from", "")
 
-    hello_task = None
     if origin == "smart":
         state.widgets.add(connection)
         log(f"widget connected ({len(state.widgets)} online)")
         with contextlib.suppress(Exception):
             await connection.send(encrypt(widget_hello()))
             await connection.send(encrypt(state.last_switch or SWITCH_MESSAGE))
+        with contextlib.suppress(Exception):
+            await send_panel_hello(state)
     elif origin == "cam":
         state.panels.add(connection)
         log(f"panel connected ({len(state.panels)} online)")
         with contextlib.suppress(Exception):
             await connection.send(encrypt(panel_hello(state)))
-
-        async def hello_loop():
-            while True:
-                await asyncio.sleep(4)
-                try:
-                    await connection.send(encrypt(panel_hello(state)))
-                    log_slow("hello_repeat", "panel hello repeated", 60.0)
-                except Exception:
-                    return
-
-        hello_task = asyncio.create_task(hello_loop())
 
     try:
         async for raw in connection:
@@ -959,8 +963,6 @@ async def relay_handler(connection, state, obs):
     except Exception as exc:
         log(f"connection from {origin or 'unknown'}: {exc}")
     finally:
-        if hello_task:
-            hello_task.cancel()
         if connection in state.widgets:
             state.widgets.discard(connection)
             log("widget disconnected")
