@@ -48,7 +48,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 APP = "phonecam"
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 
 HOME = Path.home()
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -819,6 +819,14 @@ class RelayState:
         self.widgets = set()
         self.panels = set()
         self.last_switch = None
+        # Init requests the widget sends to the extension (switchConnectClient,
+        # appIframeInit, ...). Cached so a panel that connects later still gets
+        # them; otherwise the widget stays empty until the page is reloaded.
+        self.handshake = {}
+        # Last message per state key seen from the panel. The extension answers
+        # a reconnecting widget only once per session, so a reloaded page would
+        # stay empty; replaying this cache fills it again.
+        self.panel_cache = {}
         self.started = time.time()
 
 
@@ -884,6 +892,46 @@ async def send_panel_hello(state):
             state.panels.discard(panel)
 
 
+async def replay_handshake(state, panel):
+    """Re-send the widget's init requests to a panel that just connected."""
+    for message in list(state.handshake.values()):
+        try:
+            await panel.send(encrypt(message))
+        except Exception:
+            state.panels.discard(panel)
+            return
+
+
+def cache_key(message):
+    """Stable identity for a panel message, used to keep only the latest.
+
+    Nested payloads (BACKGROUND_CACHE_DATA wraps its real key two levels deep)
+    must not collapse into a single entry, or the replay loses most of the state.
+    """
+    data = message.get("data") if isinstance(message.get("data"), dict) else {}
+    parts = [str(message.get("type")),
+             str(data.get("type") or message.get("update_type") or "")]
+    node = data
+    for _ in range(3):
+        node = node.get("data") if isinstance(node, dict) else None
+        if not isinstance(node, dict):
+            break
+        inner = node.get("type") or node.get("gameplayType")
+        if inner:
+            parts.append(str(inner))
+            break
+    return tuple(parts)
+
+
+async def replay_panel_cache(state, connection):
+    """Fill a freshly connected widget with the last known panel state."""
+    for message in list(state.panel_cache.values()):
+        try:
+            await connection.send(encrypt(message))
+        except Exception:
+            return
+
+
 async def relay_handler(connection, state, obs):
     path = connection.request.path
     query = path.split("?", 1)[1] if "?" in path else ""
@@ -897,12 +945,16 @@ async def relay_handler(connection, state, obs):
             await connection.send(encrypt(widget_hello()))
             await connection.send(encrypt(state.last_switch or SWITCH_MESSAGE))
         with contextlib.suppress(Exception):
+            await replay_panel_cache(state, connection)
+        with contextlib.suppress(Exception):
             await send_panel_hello(state)
     elif origin == "cam":
         state.panels.add(connection)
         log(f"panel connected ({len(state.panels)} online)")
         with contextlib.suppress(Exception):
             await connection.send(encrypt(panel_hello(state)))
+        with contextlib.suppress(Exception):
+            await replay_handshake(state, connection)
 
     try:
         async for raw in connection:
@@ -945,6 +997,9 @@ async def relay_handler(connection, state, obs):
                 continue
 
             if origin == "smart":
+                data = message.get("data")
+                if mtype == "202" and isinstance(data, dict) and data.get("type"):
+                    state.handshake[data["type"]] = message
                 for panel in list(state.panels):
                     try:
                         await panel.send(encrypt(message))
@@ -955,6 +1010,8 @@ async def relay_handler(connection, state, obs):
                 if isinstance(data, dict) and data.get("type") == "switchConnectClient":
                     state.last_switch = message
                     log("cached switchConnectClient")
+                else:
+                    state.panel_cache[cache_key(message)] = message
                 for widget in list(state.widgets):
                     try:
                         await widget.send(encrypt(message))

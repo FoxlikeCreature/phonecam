@@ -1,6 +1,6 @@
 pkgbase = phonecam-git
 	pkgdesc = Phone camera and Lovense Cam overlay for OBS
-	pkgver = 1.1.1
+	pkgver = 1.1.2
 	pkgrel = 1
 	url = https://github.com/FoxlikeCreature/phonecam
 	arch = any
